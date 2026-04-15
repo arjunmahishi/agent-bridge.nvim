@@ -1,166 +1,139 @@
---- agent-bridge.nvim: Minimal bridge from Neovim to external AI coding agents
-local server = require("bridge.server")
-local lockfile = require("bridge.lockfile")
+--- agent-bridge.nvim: Send contextual messages from Neovim to external AI agents via tmux
+local tmux = require("bridge.tmux")
 
 local M = {}
 
-local defaults = {
-  auto_start = true,
-  port_range = { min = 10000, max = 65535 },
-  agents = {
-    claude = { lock_dir = "~/.claude/ide" },
-  },
+M.config = {
+  processes = { "claude", "opencode" },
 }
 
 M.state = {
-  config = nil,
-  port = nil,
-  auth_token = nil,
-  running = false,
+  target = nil, -- tmux pane target e.g. "mysession:0.1"
 }
 
----Merge user config with defaults (one level deep)
----@param user_opts table|nil
----@return table
-local function merge_config(user_opts)
-  if not user_opts then
-    return vim.deepcopy(defaults)
-  end
-
-  local config = vim.deepcopy(defaults)
-  for k, v in pairs(user_opts) do
-    if type(v) == "table" and type(config[k]) == "table" then
-      for kk, vv in pairs(v) do
-        config[k][kk] = vv
-      end
-    else
-      config[k] = v
-    end
-  end
-  return config
-end
-
----Start the WebSocket MCP server and write lockfiles
----@return number|nil port The port, or nil on error
-function M.start()
-  if M.state.running then
-    vim.notify("[bridge] Already running on port " .. M.state.port, vim.log.levels.WARN)
-    return M.state.port
-  end
-
-  M.state.auth_token = lockfile.generate_auth_token()
-
-  local port, err = server.start(
-    M.state.config,
-    M.state.auth_token,
-    function() -- on_connect
-      vim.notify("[bridge] Agent connected", vim.log.levels.INFO)
-    end,
-    function() -- on_disconnect
-      vim.notify("[bridge] Agent disconnected", vim.log.levels.INFO)
-    end
-  )
-
-  if not port then
-    vim.notify("[bridge] Failed to start: " .. (err or "unknown error"), vim.log.levels.ERROR)
-    return nil
-  end
-
-  lockfile.create_all(port, M.state.auth_token, M.state.config.agents)
-
-  M.state.port = port
-  M.state.running = true
-  vim.notify("[bridge] Listening on port " .. port, vim.log.levels.INFO)
-  return port
-end
-
----Stop the server and remove lockfiles
-function M.stop()
-  if not M.state.running then
+---Pick a tmux pane to connect to via Telescope with terminal preview
+---@param callback function|nil Called after selection with the target string
+function M.connect(callback)
+  if not tmux.is_available() then
+    vim.notify("[bridge] Not inside tmux", vim.log.levels.ERROR)
     return
   end
 
-  server.stop()
-
-  if M.state.port then
-    lockfile.remove_all(M.state.port, M.state.config.agents)
+  local panes = tmux.filter_panes(tmux.list_panes(), M.config.processes)
+  if #panes == 0 then
+    vim.notify("[bridge] No matching tmux panes found", vim.log.levels.ERROR)
+    return
   end
 
-  M.state.port = nil
-  M.state.auth_token = nil
-  M.state.running = false
-  vim.notify("[bridge] Stopped", vim.log.levels.INFO)
+  local pickers = require("telescope.pickers")
+  local finders = require("telescope.finders")
+  local previewers = require("telescope.previewers")
+  local actions = require("telescope.actions")
+  local action_state = require("telescope.actions.state")
+  local conf = require("telescope.config").values
+
+  pickers.new({}, {
+    prompt_title = "Select target pane",
+    finder = finders.new_table({
+      results = panes,
+      entry_maker = function(pane)
+        local display = pane.target .. "  (" .. pane.command .. "  " .. pane.path .. ")"
+        return {
+          value = pane.target,
+          display = display,
+          ordinal = display,
+        }
+      end,
+    }),
+    sorter = conf.generic_sorter({}),
+    previewer = previewers.new_termopen_previewer({
+      get_command = function(entry)
+        return { "sh", "-c", "tmux capture-pane -t '" .. entry.value .. "' -e -p | less -RSX +G" }
+      end,
+    }),
+    attach_mappings = function(prompt_bufnr)
+      actions.select_default:replace(function()
+        local entry = action_state.get_selected_entry()
+        actions.close(prompt_bufnr)
+        if not entry then return end
+        M.state.target = entry.value
+        vim.notify("[bridge] Connected to " .. entry.value, vim.log.levels.INFO)
+        if callback then callback(entry.value) end
+      end)
+      return true
+    end,
+  }):find()
 end
 
----Get the current status
----@return table status { running, port, clients }
+---Send raw text to the connected tmux pane
+---@param text string The text to send
+function M.send(text)
+  if not M.state.target then
+    vim.notify("[bridge] Not connected. Run :BridgeConnect first", vim.log.levels.WARN)
+    return
+  end
+
+  local ok = tmux.send_text(M.state.target, text)
+  if not ok then
+    vim.notify("[bridge] Failed to send to " .. M.state.target, vim.log.levels.ERROR)
+  end
+end
+
+---Get the current connection status
+---@return table status { connected, target }
 function M.status()
   return {
-    running = M.state.running,
-    port = M.state.port,
-    clients = server.get_client_count(),
+    connected = M.state.target ~= nil,
+    target = M.state.target,
   }
 end
 
----Check if any agent is connected
----@return boolean
-function M.is_connected()
-  return server.get_client_count() > 0
-end
-
----Send an at_mentioned notification to all connected agents
----@param file_path string Absolute path to the file
----@param start_line number|nil 0-indexed start line (nil for whole file)
----@param end_line number|nil 0-indexed end line (nil for whole file)
----@param comment string|nil Optional comment text
-function M.send(file_path, start_line, end_line, comment)
-  if not M.state.running then
-    vim.notify("[bridge] Not running. Call :BridgeStart first", vim.log.levels.WARN)
-    return
+---Format file context + comment into a sendable string
+---@param file_path string
+---@param start_line number 1-indexed
+---@param end_line number 1-indexed
+---@param comment string|nil
+---@return string
+local function format_message(file_path, start_line, end_line, comment)
+  -- Use path relative to cwd when possible
+  local cwd = vim.fn.getcwd() .. "/"
+  local rel_path = file_path
+  if file_path:sub(1, #cwd) == cwd then
+    rel_path = file_path:sub(#cwd + 1)
   end
 
-  if not M.is_connected() then
-    vim.notify("[bridge] No agent connected", vim.log.levels.WARN)
-    return
+  local line_part
+  if start_line == end_line then
+    line_part = tostring(start_line)
+  else
+    line_part = start_line .. "-" .. end_line
   end
 
-  local params = {
-    filePath = file_path,
-    lineStart = start_line,
-    lineEnd = end_line,
-  }
+  local msg = "@" .. rel_path .. ":" .. line_part
   if comment and comment ~= "" then
-    params.comment = comment
+    msg = msg .. " " .. comment
   end
 
-  server.broadcast("at_mentioned", params)
+  return msg
 end
 
 ---Initialize the plugin
----@param opts table|nil User configuration
+---@param opts table|nil User configuration (reserved for future use)
 function M.setup(opts)
-  M.state.config = merge_config(opts)
+  M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 
-  -- User commands
-  vim.api.nvim_create_user_command("BridgeStart", function()
-    M.start()
-  end, { desc = "Start agent bridge server" })
-
-  vim.api.nvim_create_user_command("BridgeStop", function()
-    M.stop()
-  end, { desc = "Stop agent bridge server" })
+  vim.api.nvim_create_user_command("BridgeConnect", function()
+    M.connect()
+  end, { desc = "Connect to a tmux pane" })
 
   vim.api.nvim_create_user_command("BridgeStatus", function()
     local s = M.status()
-    if s.running then
-      vim.notify(
-        string.format("[bridge] Running on port %d, %d client(s) connected", s.port, s.clients),
-        vim.log.levels.INFO
-      )
+    if s.connected then
+      vim.notify("[bridge] Connected to " .. s.target, vim.log.levels.INFO)
     else
-      vim.notify("[bridge] Not running", vim.log.levels.INFO)
+      vim.notify("[bridge] Not connected", vim.log.levels.INFO)
     end
-  end, { desc = "Show agent bridge status" })
+  end, { desc = "Show bridge connection status" })
 
   vim.api.nvim_create_user_command("BridgeSend", function(cmd_opts)
     local file_path = vim.api.nvim_buf_get_name(0)
@@ -171,31 +144,29 @@ function M.setup(opts)
 
     local start_line, end_line
     if cmd_opts.range > 0 then
-      start_line = cmd_opts.line1 - 1
-      end_line = cmd_opts.line2 - 1
+      start_line = cmd_opts.line1
+      end_line = cmd_opts.line2
     else
-      local cursor_line = vim.api.nvim_win_get_cursor(0)[1] - 1
-      start_line = cursor_line
-      end_line = cursor_line
+      start_line = vim.api.nvim_win_get_cursor(0)[1]
+      end_line = start_line
     end
 
-    vim.ui.input({ prompt = "Comment: " }, function(comment)
-      if comment == nil then return end
-      M.send(file_path, start_line, end_line, comment)
-    end)
-  end, { range = true, desc = "Send file/selection to connected agent" })
+    local do_send = function()
+      vim.ui.input({ prompt = "Comment: " }, function(comment)
+        if comment == nil then return end
+        local msg = format_message(file_path, start_line, end_line, comment)
+        M.send(msg)
+      end)
+    end
 
-  -- Cleanup on exit
-  vim.api.nvim_create_autocmd("VimLeavePre", {
-    callback = function()
-      M.stop()
-    end,
-  })
-
-  -- Auto-start if configured
-  if M.state.config.auto_start then
-    M.start()
-  end
+    if not M.state.target then
+      M.connect(function()
+        do_send()
+      end)
+    else
+      do_send()
+    end
+  end, { range = true, desc = "Send file context + comment to connected agent" })
 end
 
 return M
