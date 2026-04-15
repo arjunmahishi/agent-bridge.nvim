@@ -33,10 +33,12 @@ With [lazy.nvim](https://github.com/folke/lazy.nvim):
     })
   end,
   keys = {
-    { "<leader>bs", "<cmd>BridgeSend<cr>", mode = { "n", "v" }, desc = "Send to agent" },
+    { "<leader>bs", "<cmd>BridgeSend<cr>", mode = "n", desc = "Send to agent" },
+    { "<leader>bs", ":'<,'>BridgeSend<cr>", mode = "v", desc = "Send to agent" },
     { "<leader>bc", "<cmd>BridgeConnect<cr>", desc = "Connect to tmux pane" },
     { "<leader>bt", "<cmd>BridgeStatus<cr>", desc = "Bridge status" },
-    { "<leader>ba", "<cmd>BridgeComment<cr>", mode = { "n", "v" }, desc = "Add review comment" },
+    { "<leader>ba", "<cmd>BridgeComment<cr>", mode = "n", desc = "Add review comment" },
+    { "<leader>ba", ":'<,'>BridgeComment<cr>", mode = "v", desc = "Add review comment" },
     { "<leader>br", "<cmd>BridgeReview<cr>", desc = "Review pending comments" },
     { "<leader>bx", "<cmd>BridgeSubmit<cr>", desc = "Submit review comments" },
     { "<leader>bd", "<cmd>BridgeDiscard<cr>", desc = "Discard review comments" },
