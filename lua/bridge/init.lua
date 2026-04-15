@@ -1,5 +1,6 @@
 --- agent-bridge.nvim: Send contextual messages from Neovim to external AI agents via tmux
 local tmux = require("bridge.tmux")
+local review = require("bridge.review")
 
 local M = {}
 
@@ -94,7 +95,7 @@ end
 ---@param end_line number 1-indexed
 ---@param comment string|nil
 ---@return string
-local function format_message(file_path, start_line, end_line, comment)
+function M.format_message(file_path, start_line, end_line, comment)
   -- Use path relative to cwd when possible
   local cwd = vim.fn.getcwd() .. "/"
   local rel_path = file_path
@@ -128,11 +129,17 @@ function M.setup(opts)
 
   vim.api.nvim_create_user_command("BridgeStatus", function()
     local s = M.status()
+    local msg
     if s.connected then
-      vim.notify("[bridge] Connected to " .. s.target, vim.log.levels.INFO)
+      msg = "[bridge] Connected to " .. s.target
     else
-      vim.notify("[bridge] Not connected", vim.log.levels.INFO)
+      msg = "[bridge] Not connected"
     end
+    local pending = review.count()
+    if pending > 0 then
+      msg = msg .. " | " .. pending .. " review comment" .. (pending == 1 and "" or "s") .. " pending"
+    end
+    vim.notify(msg, vim.log.levels.INFO)
   end, { desc = "Show bridge connection status" })
 
   vim.api.nvim_create_user_command("BridgeSend", function(cmd_opts)
@@ -154,7 +161,7 @@ function M.setup(opts)
     local do_send = function()
       vim.ui.input({ prompt = "Comment: " }, function(comment)
         if comment == nil then return end
-        local msg = format_message(file_path, start_line, end_line, comment)
+        local msg = M.format_message(file_path, start_line, end_line, comment)
         M.send(msg)
       end)
     end
@@ -167,6 +174,62 @@ function M.setup(opts)
       do_send()
     end
   end, { range = true, desc = "Send file context + comment to connected agent" })
+
+  vim.api.nvim_create_user_command("BridgeComment", function(cmd_opts)
+    local file_path = vim.api.nvim_buf_get_name(0)
+    if file_path == "" then
+      vim.notify("[bridge] No file in current buffer", vim.log.levels.WARN)
+      return
+    end
+
+    local start_line, end_line
+    if cmd_opts.range > 0 then
+      start_line = cmd_opts.line1
+      end_line = cmd_opts.line2
+    else
+      start_line = vim.api.nvim_win_get_cursor(0)[1]
+      end_line = start_line
+    end
+
+    local existing = review.find_by_location(file_path, start_line, end_line)
+    local default = existing and existing.comment or ""
+
+    vim.ui.input({ prompt = "Review comment: ", default = default }, function(comment)
+      if comment == nil then return end
+      if comment == "" and existing then
+        review.remove(existing.id)
+        vim.notify("[bridge] Comment removed", vim.log.levels.INFO)
+      elseif comment ~= "" then
+        review.add(file_path, start_line, end_line, comment)
+        vim.notify("[bridge] Comment added (" .. review.count() .. " pending)", vim.log.levels.INFO)
+      end
+    end)
+  end, { range = true, desc = "Add a review comment at current line/selection" })
+
+  vim.api.nvim_create_user_command("BridgeReview", function()
+    review.open_review()
+  end, { desc = "Review pending bridge comments" })
+
+  vim.api.nvim_create_user_command("BridgeSubmit", function()
+    if review.count() == 0 then
+      vim.notify("[bridge] No pending review comments", vim.log.levels.INFO)
+      return
+    end
+    if not M.state.target then
+      M.connect(function()
+        review.submit(M.send, M.format_message)
+      end)
+    else
+      review.submit(M.send, M.format_message)
+    end
+  end, { desc = "Submit all pending review comments" })
+
+  vim.api.nvim_create_user_command("BridgeDiscard", function()
+    review.discard()
+  end, { desc = "Discard all pending review comments" })
+
+  local augroup = vim.api.nvim_create_augroup("BridgeReview", { clear = true })
+  review.setup(augroup)
 end
 
 return M
